@@ -435,26 +435,31 @@ class PurchaseInfoStream(SherpaStream):
     schema = th.PropertiesList(
         th.Property("SupplierCode", th.StringType),
         th.Property("PurchaseOrderNumber", th.StringType),
-        th.Property("PurchaseDate", th.StringType),
-        th.Property("PurchaseStatus", th.DateTimeType),
+        th.Property("PurchaseDate", th.DateTimeType),
+        th.Property("PurchaseStatus", th.StringType),
         th.Property("Reference", th.StringType),
         th.Property("WarehouseCode", th.StringType),
-        th.Property("PurchaseLines", th.StringType)
+        th.Property(
+            "PurchaseLines",
+            th.ArrayType(
+                th.ObjectType(
+                    th.Property("SupplierItemCode", th.StringType),
+                    th.Property("ItemCode", th.StringType),
+                    th.Property("Description", th.StringType),
+                    th.Property("QuantityOrdered", th.IntegerType),
+                    th.Property("QuantityReceived", th.IntegerType),
+                    th.Property("QuantityInvoiced", th.IntegerType),
+                    th.Property("Price", th.NumberType),
+                    th.Property("Amount", th.NumberType),
+                    th.Property("DateExpected", th.DateTimeType),
+                    th.Property("ReceivedDate", th.DateTimeType),
+                    th.Property("SupplierPurchaseQty", th.IntegerType),
+                    th.Property("QuantityOrderedSupplier", th.IntegerType),
+                    th.Property("Rebate", th.NumberType),
+                )
+            ),
+        ),
     ).to_dict()
-
-    def _process_nested_objects(self, item: dict) -> dict:
-        """Turn PurchaseLines from the response into a JSON array string."""
-        raw = item.get("PurchaseLines") or item.get("PurchaseLine")
-        if isinstance(raw, dict) and "PurchaseLine" in raw:
-            pl = raw["PurchaseLine"]
-            lines = pl if isinstance(pl, list) else [pl] if pl else []
-        elif isinstance(raw, list):
-            lines = raw
-        else:
-            lines = []
-        processed = super()._process_nested_objects(item)
-        processed["PurchaseLines"] = json.dumps(lines)
-        return processed
 
     def _get_soap_envelope(self, token: int = 0, count: int = 200, **kwargs) -> str:
         """Generate SOAP envelope for PurchaseInfo."""
@@ -469,16 +474,25 @@ class PurchaseInfoStream(SherpaStream):
 </soap12:Envelope>"""
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get purchase info using the purchase_number from parent context."""
         self._current_purchase_number = context["purchase_number"]
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
+    
+        for record in self.get_records_with_token_pagination(
             get_soap_envelope=self._get_soap_envelope,
             service_name="PurchaseInfo",
             items_key="ResponseValue",
             context=context,
-            page_size=page_size,
-        )
+            page_size=self.config.get("chunk_size", 200),
+        ):
+            lines = record.get("PurchaseLines", {}).get("PurchaseLine")
+    
+            if lines is None:
+                record["PurchaseLines"] = []
+            elif isinstance(lines, dict):
+                record["PurchaseLines"] = [lines]
+            else:
+                record["PurchaseLines"] = lines
+    
+            yield record
 
 
 class ChangedStockByWarehouseGroupCodeStream(SherpaStream):
