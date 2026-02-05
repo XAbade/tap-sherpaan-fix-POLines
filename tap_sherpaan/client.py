@@ -354,9 +354,7 @@ class SherpaStream(Stream):
             self.logger.info(f"[{self.name}] Making single request (no pagination)")
         else:
             # Paginated stream - get token from state
-            token = self.get_starting_replication_key_value(context)
-            if not token or token == "0":
-                token = "1"
+            token = self.get_starting_replication_key_value(context) or "0"
             self.logger.info(f"[{self.name}] Starting sync with token: {token}")
 
         while True:
