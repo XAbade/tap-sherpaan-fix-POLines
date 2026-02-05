@@ -439,37 +439,25 @@ class PurchaseInfoStream(SherpaStream):
         th.Property("PurchaseStatus", th.DateTimeType),
         th.Property("Reference", th.StringType),
         th.Property("WarehouseCode", th.StringType),
-        th.Property("PurchaseLines", th.StringType)
+        th.Property("PurchaseLine", th.StringType)
     ).to_dict()
 
     def _process_nested_objects(self, item: dict) -> dict:
-        """Process item and set PurchaseLines to a flat JSON array of line objects."""
+        """Ensure PurchaseLine is always set: xmltodict returns one child as dict, not list."""
         processed = super()._process_nested_objects(item)
-        # Find lines data (key may be PurchaseLines, PurchaseLine, or namespaced)
-        raw = processed.get("PurchaseLines") or processed.get("PurchaseLine")
-        if raw is None:
-            for key, value in processed.items():
-                if value is not None and "PurchaseLine" in key:
-                    raw = value
-                    break
-        if raw is not None:
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                    if isinstance(data, dict) and "PurchaseLine" in data:
-                        pl = data["PurchaseLine"]
-                        lines = pl if isinstance(pl, list) else [pl]
-                        processed["PurchaseLines"] = json.dumps(lines)
-                    else:
-                        processed["PurchaseLines"] = raw
-                except json.JSONDecodeError:
-                    processed["PurchaseLines"] = raw
-            else:
-                processed["PurchaseLines"] = json.dumps(raw) if isinstance(raw, list) else json.dumps([raw])
-        # Keep only PurchaseLines; drop PurchaseLine and any namespaced variant
-        for key in list(processed.keys()):
-            if key != "PurchaseLines" and "PurchaseLine" in key:
-                del processed[key]
+        if processed.get("PurchaseLine"):
+            return processed
+        raw = processed.get("PurchaseLines")
+        if not raw:
+            return processed
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict) and "PurchaseLine" in data:
+                    pl = data["PurchaseLine"]
+                    processed["PurchaseLine"] = json.dumps(pl if isinstance(pl, list) else [pl])
+            except json.JSONDecodeError:
+                pass
         return processed
 
     def _get_soap_envelope(self, token: int = 0, count: int = 200, **kwargs) -> str:
