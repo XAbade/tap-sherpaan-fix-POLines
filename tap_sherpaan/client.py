@@ -1,584 +1,437 @@
-"""Stream type classes for tap-sherpaan."""
+"""SOAP client and base stream class for tap-sherpaan."""
 
 from __future__ import annotations
 
 import html
 import json
-from typing import Dict, Any, Iterable, Optional
-from singer_sdk import typing as th
-from tap_sherpaan.client import SherpaStream
+import logging
+from typing import Any, Callable, Dict, Iterable, Optional, Union
+
+import xmltodict
+from requests import Session
+from tenacity import retry, stop_after_attempt, wait_exponential
+from zeep import Client, Settings
+from zeep.transports import Transport
+
+from singer_sdk.streams import Stream
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("zeep").setLevel(logging.WARNING)
+logging.getLogger("zeep.transports").setLevel(logging.WARNING)
+logging.getLogger("zeep.xsd.schema").setLevel(logging.WARNING)
+logging.getLogger("zeep.wsdl.wsdl").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
 
 
-class ChangedItemsInformationStream(SherpaStream):
-    """Stream for changed items information."""
-    
-    name = "changed_items_information"
-    primary_keys = ["ItemCode"]
-    replication_key = "Token"
-    schema = th.PropertiesList(
-        th.Property("ItemCode", th.StringType),
-        th.Property("ItemStatus", th.StringType),
-        th.Property("Token", th.StringType),
-        th.Property("ItemType", th.StringType),
-        th.Property("Description", th.StringType),
-        th.Property("Brand", th.StringType),
-        th.Property("AutoStockLevel", th.BooleanType),
-        th.Property("Dropship", th.BooleanType),
-        th.Property("HideOnPicklist", th.BooleanType),
-        th.Property("HideOnInvoice", th.BooleanType),
-        th.Property("HideOnReturnDocument", th.BooleanType),
-        th.Property("PrintLabelsReceivedPurchaseItems", th.BooleanType),
-        th.Property("CostPrice", th.StringType),
-        th.Property("Price", th.StringType),
-        th.Property("VatCode", th.StringType),
-        th.Property("StockPeriod", th.StringType),
-        th.Property("OrderVolume", th.StringType),
-        th.Property("OrderVolumeCeilFrom", th.StringType),
-        th.Property("PriceIncl", th.StringType),
-        th.Property("Weight", th.StringType),
-        th.Property("Length", th.StringType),
-        th.Property("Width", th.StringType),
-        th.Property("Height", th.StringType),
-        th.Property("DateAdded", th.DateTimeType),
-        th.Property("AvgPurchasePrice", th.StringType),
-        th.Property("StockInAllWarehouses", th.StringType),
-        th.Property("ReservedInAllWarehouses", th.StringType),
-        th.Property("AvailableStockInAllWarehouses", th.StringType),
-        th.Property("EanCode", th.StringType),
-        th.Property("CustomFields", th.StringType),
-        th.Property("Warehouses", th.StringType),
-        th.Property("ItemSuppliers", th.StringType),
-        th.Property("ItemAssemblies", th.StringType),
-        th.Property("ItemPurchases", th.StringType),
-    ).to_dict()
+class SherpaClient:
+    """SOAP client for Sherpa API."""
 
-    def _get_soap_envelope(self, token: int, count: int = 200) -> str:
-        """Generate SOAP envelope for ChangedItemsInformation."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:ChangedItemsInformation xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:token>{token}</tns:token>
-      <tns:count>{count}</tns:count>
-      <tns:itemInformationTypes>
-        <tns:ItemInformationType>General</tns:ItemInformationType>
-        <tns:ItemInformationType>EanCode</tns:ItemInformationType>
-        <tns:ItemInformationType>CustomFields</tns:ItemInformationType>
-        <tns:ItemInformationType>Warehouses</tns:ItemInformationType>
-        <tns:ItemInformationType>ItemSuppliers</tns:ItemInformationType>
-        <tns:ItemInformationType>ItemAssemblies</tns:ItemInformationType>
-        <tns:ItemInformationType>ItemPurchases</tns:ItemInformationType>
-      </tns:itemInformationTypes>
-    </tns:ChangedItemsInformation>
-  </soap12:Body>
-</soap12:Envelope>"""
+    def __init__(
+        self,
+        shop_id: str,
+        tap: "TapSherpaan",
+        timeout: int = 300,
+    ) -> None:
+        """Initialize the Sherpa SOAP client.
 
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get records using token-based pagination."""
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="ChangedItemsInformation",
-            items_key="ItemCodeTokenItemInformation",
-            context=context,
-            page_size=page_size,
+        Args:
+            shop_id: The shop ID for the Sherpa SOAP service
+            tap: The tap instance to get configuration from
+            timeout: Request timeout in seconds
+        """
+        self.shop_id = shop_id
+
+        # Determine base URL:
+        # - If tap config provides "base_url", use that.
+        # - Otherwise default to the production endpoint.
+        base_url = (getattr(tap, "config", {}) or {}).get(
+            "base_url",
+            "https://sherpaservices-prd.sherpacloud.eu",
         )
+        # Normalise to avoid trailing slash issues
+        self.base_url = base_url.rstrip("/")
 
-
-class ChangedStockStream(SherpaStream):
-    """Stream for changed stock."""
-    
-    name = "changed_stock"
-    primary_keys = ["ItemCode", "WarehouseCode"]
-    replication_key = "Token"
-    schema = th.PropertiesList(
-        th.Property("ItemCode", th.StringType),
-        th.Property("Available", th.StringType),
-        th.Property("Stock", th.StringType),
-        th.Property("Reserved", th.StringType),
-        th.Property("ItemStatus", th.StringType),
-        th.Property("ExpectedDate", th.DateTimeType),
-        th.Property("QtyWaitingToReceive", th.StringType),
-        th.Property("FirstExpectedDate", th.DateTimeType),
-        th.Property("FirstExpectedQtyWaitingToReceive", th.StringType),
-        th.Property("LastModified", th.DateTimeType),
-        th.Property("AvgPurchasePrice", th.StringType),
-        th.Property("WarehouseCode", th.StringType),
-        th.Property("CostPrice", th.StringType),
-        th.Property("Token", th.StringType)
-    ).to_dict()
-
-    def _get_soap_envelope(self, token: int, count: int = 200) -> str:
-        """Generate SOAP envelope for ChangedStock."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:ChangedStock xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:token>{token}</tns:token>
-      <tns:maxResult>{count}</tns:maxResult>
-    </tns:ChangedStock>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get records using token-based pagination."""
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="ChangedStock",
-            items_key="ItemStockToken",
-            context=context,
-            page_size=page_size,
+        self.wsdl_url = f"{self.base_url}/{shop_id}/Sherpa.asmx?wsdl"
+        session = Session()
+        session.headers.update({
+            "Content-Type": "text/xml; charset=utf-8",
+            "User-Agent": "PostmanRuntime/7.32.3",
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive"
+        })
+        transport = Transport(session=session, timeout=timeout)
+        settings = Settings(strict=False)
+        self.client = Client(
+            self.wsdl_url,
+            transport=transport,
+            settings=settings,
         )
+        self.tap = tap
+        self.session = session
+
+    def call_custom_soap_service(self, service_name: str, soap_envelope: str) -> dict:
+        """Call a SOAP service with a custom envelope.
+
+        Args:
+            service_name: Name of the SOAP service (for SOAPAction header)
+            soap_envelope: The complete SOAP envelope XML
+
+        Returns:
+            Response from the SOAP service
+        """
+        self.session.headers.update({
+            "SOAPAction": f'"http://sherpa.sherpaan.nl/{service_name}"'
+        })
+
+        try:
+            response = self.session.post(
+                self.wsdl_url.replace("?wsdl", ""),
+                data=soap_envelope,
+                timeout=300
+            )
+            response.raise_for_status()
+            return {"raw_response": response.text}
+        except Exception as e:
+            self.tap.logger.error(f"Error in call_custom_soap_service: {e}")
+            raise
 
 
-class ChangedSuppliersStream(SherpaStream):
-    """Stream for changed suppliers."""
+class SherpaStream(Stream):
+    """Base stream class for Sherpa streams with pagination support."""
     
-    name = "changed_suppliers"
-    primary_keys = ["ClientCode"]
-    replication_key = "Token"
-    schema = th.PropertiesList(
-        th.Property("ClientCode", th.StringType),
-        th.Property("Active", th.StringType),
-        th.Property("Token", th.StringType)
-    ).to_dict()
+    # Default to pagination enabled
+    paginate = True
 
-    def _get_soap_envelope(self, token: int, count: int = 200) -> str:
-        """Generate SOAP envelope for ChangedSuppliers."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:ChangedSuppliers xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:token>{token}</tns:token>
-      <tns:count>{count}</tns:count>
-    </tns:ChangedSuppliers>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get records using token-based pagination."""
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="ChangedSuppliers",
-            items_key="ClientCodeToken",
-            context=context,
-            page_size=page_size,
+    def __init__(self, *args, **kwargs):
+        """Initialize the stream."""
+        super().__init__(*args, **kwargs)
+        self.client = SherpaClient(
+            shop_id=self.config["shop_id"],
+            tap=self._tap,
         )
+        self._total_records = 0
 
-    def get_child_context(self, record: dict, context: Optional[dict]) -> dict:
-        """Return a context dictionary for child streams."""
-        return {
-            "client_code": record["ClientCode"],
-        }
-
-
-class SupplierInfoStream(SherpaStream):
-    """Stream for supplier info."""
-    
-    name = "supplier_info"
-    parent_stream_type = ChangedSuppliersStream
-    primary_keys = ["ClientCode"]
-    paginate = False
-    schema = th.PropertiesList(
-        th.Property("SupplierCode", th.StringType),
-        th.Property("Token", th.StringType),
-        th.Property("Remarks", th.StringType),
-        th.Property("CustomFields", th.StringType),
-        th.Property("AddressType", th.StringType),
-        th.Property("Gender", th.StringType),
-        th.Property("Name", th.StringType),
-        th.Property("NameFirst", th.StringType),
-        th.Property("NamePreLast", th.StringType),
-        th.Property("NameLast", th.StringType),
-        th.Property("Company", th.StringType),
-        th.Property("Phone", th.StringType),
-        th.Property("Street", th.StringType),
-        th.Property("HouseNumber", th.StringType),
-        th.Property("HouseNumberAddon", th.StringType),
-        th.Property("PostalCode", th.StringType),
-        th.Property("City", th.StringType),
-        th.Property("CountryCode", th.StringType),
-        th.Property("CountryName", th.StringType),
-        th.Property("StateCode", th.StringType),
-        th.Property("TaxIdNumber", th.StringType),
-        th.Property("BankAccount", th.StringType),
-        th.Property("NameBankAccount", th.StringType),
-        th.Property("CityBankAccount", th.StringType),
-        th.Property("BicCode", th.StringType),
-        th.Property("ChamberNumber", th.StringType),
-        th.Property("Mobile", th.StringType),
-        th.Property("Fax", th.StringType),
-        th.Property("Email", th.StringType),
-        th.Property("Homepage", th.StringType),
-        th.Property("AddressLine1", th.StringType),
-        th.Property("AddressLine2", th.StringType),
-        th.Property("AddressLine3", th.StringType),
-        th.Property("EmailAddressIsInvalid", th.StringType),
-        th.Property("AllowMailing", th.StringType),
-        th.Property("FullAddress", th.StringType),
-        th.Property("PersonalNumber", th.StringType),
-        th.Property("OrderPeriod", th.StringType),
-        th.Property("DeliveryPeriod", th.StringType),
-        th.Property("AutoPreferredItemSupplier", th.StringType)
-    ).to_dict()
-
-    def _get_soap_envelope(self, token: int = 0, count: int = 200, **kwargs) -> str:
-        """Generate SOAP envelope for SupplierInfo."""
-        encoded_supplier_code = html.escape(self._current_client_code)
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:SupplierInfo xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:supplierCode>{encoded_supplier_code}</tns:supplierCode>
-    </tns:SupplierInfo>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get supplier info using the client_code from parent context."""
-        self._current_client_code = context["client_code"]
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="SupplierInfo",
-            items_key="ResponseValue",
-            context=context,
-            page_size=page_size,
-        )
-
-
-class ChangedItemSuppliersWithDefaultsStream(SherpaStream):
-    """Stream for changed item suppliers with defaults."""
-    
-    name = "changed_item_suppliers_with_defaults"
-    primary_keys = ["ItemCode", "ClientCode"]
-    replication_key = "Token"
-    schema = th.PropertiesList(
-        th.Property("SupplierCode", th.StringType),
-        th.Property("SupplierItemCode", th.StringType),
-        th.Property("ItemCode", th.StringType),
-        th.Property("SupplierDescription", th.StringType),
-        th.Property("SupplierStock", th.StringType),
-        th.Property("SupplierPrice", th.StringType),
-        th.Property("OrderPeriod", th.StringType),
-        th.Property("DeliveryPeriod", th.StringType),
-        th.Property("Preferred", th.StringType),
-        th.Property("Token", th.StringType),
-        th.Property("AvailableFrom", th.StringType),
-        th.Property("SupplierItemStatus", th.StringType),
-        th.Property("VatCode", th.StringType),
-        th.Property("LastModified", th.StringType),
-        th.Property("MinPurchaseQty", th.StringType),
-        th.Property("SupplierPurchaseQty", th.StringType),
-        th.Property("SupplierPurchaseQtyMultiplier", th.StringType)
-    ).to_dict()
-
-    def _get_soap_envelope(self, token: int, count: int = 200) -> str:
-        """Generate SOAP envelope for ChangedItemSuppliersWithDefaults."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:ChangedItemSuppliersWithDefaults xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:token>{token}</tns:token>
-      <tns:count>{count}</tns:count>
-    </tns:ChangedItemSuppliersWithDefaults>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get records using token-based pagination."""
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="ChangedItemSuppliersWithDefaults",
-            items_key="SupplierItemCodeToken",
-            context=context,
-            page_size=page_size,
-        )
-
-
-class ChangedOrdersInformationStream(SherpaStream):
-    """Stream for changed orders information."""
-    
-    name = "changed_orders_information"
-    primary_keys = ["OrderCode"]
-    replication_key = "Token"
-    schema = th.PropertiesList(
-        th.Property("OrderNumber", th.StringType),
-        th.Property("Token", th.StringType),
-        th.Property("OrderStatus", th.StringType),
-        th.Property("OrderDate", th.DateTimeType),
-        th.Property("InvoiceDate", th.DateTimeType),
-        th.Property("SendInvoiceByEmail", th.BooleanType),
-        th.Property("NumberOfColli", th.StringType),
-        th.Property("Priority", th.BooleanType),
-        th.Property("ShippingDate", th.DateTimeType),
-        th.Property("PricesIncl", th.BooleanType),
-        th.Property("OrderAmountInclVAT", th.StringType),
-        th.Property("OrderAmountInclVATInclBackOrderItems", th.StringType),
-        th.Property("Paid", th.StringType),
-        th.Property("ElectronicPaid", th.StringType),
-        th.Property("AmountDue", th.StringType),
-        th.Property("Margin", th.StringType),
-        th.Property("WarehouseCode", th.StringType),
-        th.Property("OrderWarning", th.StringType),
-        th.Property("PaymentMethodCode", th.StringType),
-        th.Property("ParcelServiceCode", th.StringType),
-        th.Property("ParcelTypeCode", th.StringType),
-        th.Property("OrderLines", th.StringType)
-    ).to_dict()
-
-    def _get_soap_envelope(self, token: int, count: int = 200) -> str:
-        """Generate SOAP envelope for ChangedOrdersInformation."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:ChangedOrdersInformation xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:token>{token}</tns:token>
-      <tns:count>{count}</tns:count>
-      <tns:orderInformationTypes>
-        <tns:OrderInformationType>General</tns:OrderInformationType>
-        <tns:OrderInformationType>OrderLines</tns:OrderInformationType>
-      </tns:orderInformationTypes>
-    </tns:ChangedOrdersInformation>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get records using token-based pagination."""
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="ChangedOrdersInformation",
-            items_key="OrderNumberTokenOrderInformation",
-            context=context,
-            page_size=page_size,
-        )
-
-
-class ChangedPurchasesStream(SherpaStream):
-    """Stream for changed purchases."""
-    
-    name = "changed_purchases"
-    primary_keys = ["PurchaseCode"]
-    replication_key = "Token"
-    _unique_order_numbers = set()
-    schema = th.PropertiesList(
-        th.Property("PurchaseCode", th.StringType),
-        th.Property("OrderNumber", th.StringType),
-        th.Property("Token", th.StringType),
-        th.Property("PurchaseStatus", th.StringType),
-        th.Property("WarehouseCode", th.StringType)
-    ).to_dict()
-
-    def _get_soap_envelope(self, token: int, count: int = 200) -> str:
-        """Generate SOAP envelope for ChangedPurchases."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:ChangedPurchases xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:token>{token}</tns:token>
-      <tns:count>{count}</tns:count>
-    </tns:ChangedPurchases>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get records using token-based pagination."""
-        page_size = self.config.get("chunk_size", 200)
-        for record in self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="ChangedPurchases",
-            items_key="PurchaseCodeToken",
-            context=context,
-            page_size=page_size,
-        ):
-            # Only yield records that have OrderNumber
-            if record.get("OrderNumber"):
-                yield record
-
-    def get_child_context(self, record: dict, context: Optional[dict]) -> dict:
-        """Return context for child streams."""
-        purchase_number = record.get("OrderNumber")
-        if not purchase_number:
-            return None
-        
-        # Only return context for unique order numbers
-        if purchase_number in self._unique_order_numbers:
-            return None
-        
-        self._unique_order_numbers.add(purchase_number)
-        return {"purchase_number": purchase_number}
-
-    def _sync_children(self, child_context: dict) -> None:
-        """Sync child streams only if context is not None."""
-        if child_context is not None:
-            super()._sync_children(child_context)
-
-
-class PurchaseInfoStream(SherpaStream):
-    """Stream for purchase info."""
-    
-    name = "purchase_info"
-    parent_stream_type = ChangedPurchasesStream
-    primary_keys = ["PurchaseOrderNumber"]
-    paginate = False
-    schema = th.PropertiesList(
-        th.Property("SupplierCode", th.StringType),
-        th.Property("PurchaseOrderNumber", th.StringType),
-        th.Property("PurchaseDate", th.StringType),
-        th.Property("PurchaseStatus", th.DateTimeType),
-        th.Property("Reference", th.StringType),
-        th.Property("WarehouseCode", th.StringType),
-        th.Property("PurchaseLines", th.StringType)
-    ).to_dict()
+    def map_record(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Pass through the API response directly without field mapping."""
+        return item
 
     def _process_nested_objects(self, item: dict) -> dict:
-        """Process item and set PurchaseLines to a flat JSON array of line objects."""
-        processed = super()._process_nested_objects(item)
-        # Find lines data (key may be PurchaseLines, PurchaseLine, or namespaced)
-        raw = processed.get("PurchaseLines") or processed.get("PurchaseLine")
-        if raw is None:
-            for key, value in processed.items():
-                if value is not None and "PurchaseLine" in key:
-                    raw = value
-                    break
-        if raw is not None:
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                    if isinstance(data, dict) and "PurchaseLine" in data:
-                        pl = data["PurchaseLine"]
-                        lines = pl if isinstance(pl, list) else [pl]
-                        processed["PurchaseLines"] = json.dumps(lines)
-                    else:
-                        processed["PurchaseLines"] = raw
-                except json.JSONDecodeError:
-                    processed["PurchaseLines"] = raw
+        """Dynamically convert nested XML objects to flattened fields / JSON strings.
+
+        This mirrors the behaviour of the previous tap implementation:
+        - Simple fields under the ``General`` section are flattened to top-level keys
+          (so they line up with the JSON schema fields like ``ItemType``, ``Description``).
+        - Complex nested objects and lists are serialized to JSON strings.
+        - XML artefacts and pure ``xsi:nil`` markers become ``None``.
+        """
+
+        def clean_xml_artifacts(obj):
+            """Recursively clean XML artifacts from the object."""
+            if isinstance(obj, dict):
+                # If it's an empty dict, return null
+                if not obj:
+                    return None
+                cleaned = {}
+                for key, value in obj.items():
+                    # Skip XML namespace/attribute keys (e.g. '@xsi:nil')
+                    if key.startswith("@"):
+                        continue
+                    cleaned_value = clean_xml_artifacts(value)
+                    # Only add non-null values to avoid empty dicts
+                    if cleaned_value is not None:
+                        cleaned[key] = cleaned_value
+                # If all values were null or XML artefacts, return null
+                if not cleaned:
+                    return None
+                return cleaned
+            elif isinstance(obj, list):
+                return [clean_xml_artifacts(v) for v in obj]
             else:
-                processed["PurchaseLines"] = json.dumps(raw) if isinstance(raw, list) else json.dumps([raw])
-        # Keep only PurchaseLines; drop PurchaseLine and any namespaced variant
-        for key in list(processed.keys()):
-            if key != "PurchaseLines" and "PurchaseLine" in key:
-                del processed[key]
+                return obj
+
+        def flatten_dict(d: dict, parent_key: str = "", sep: str = "_") -> dict:
+            """Recursively flatten nested dictionaries.
+
+            - Fields under ``General`` are flattened without the ``General`` prefix.
+            - Complex nested dicts and lists are converted to JSON strings.
+            """
+            items: list[tuple[str, Any]] = []
+            for k, v in d.items():
+                # Skip XML namespace attributes
+                if k.startswith("@"):
+                    continue
+
+                # For General section, don't add prefix to match schema field names
+                if parent_key == "General":
+                    new_key = k
+                else:
+                    new_key = f"{parent_key}{sep}{k}" if parent_key else k
+
+                if isinstance(v, dict):
+                    # Detect dictionaries that only contain XML attributes (e.g. xsi:nil)
+                    non_attr_keys = [key for key in v.keys() if not key.startswith("@")]
+                    if not non_attr_keys:
+                        # Pure xsi:nil-style field → None
+                        items.append((new_key, None))
+                    elif k == "General":
+                        # Always fully flatten the General section
+                        flattened = flatten_dict(v, new_key, sep)
+                        items.extend(flattened.items())
+                    else:
+                        # Decide whether to flatten or JSON-encode this dict
+                        has_nested_objects = any(
+                            isinstance(val, (dict, list)) for val in v.values()
+                        )
+                        if has_nested_objects:
+                            items.append((new_key, json.dumps(clean_xml_artifacts(v))))
+                        else:
+                            flattened = flatten_dict(v, new_key, sep)
+                            items.extend(flattened.items())
+                elif isinstance(v, list):
+                    # Lists always become JSON strings
+                    items.append((new_key, json.dumps(clean_xml_artifacts(v))))
+                else:
+                    items.append((new_key, v)
+                    )
+            return dict(items)
+
+        # Start with the top-level fields, then dynamically process nested data
+        processed: Dict[str, Any] = {}
+
+        for key, value in item.items():
+            if isinstance(value, dict):
+                flattened = flatten_dict(value)
+                processed.update(flattened)
+            elif isinstance(value, list):
+                processed[key] = json.dumps(clean_xml_artifacts(value))
+            else:
+                processed[key] = value
+
         return processed
 
-    def _get_soap_envelope(self, token: int = 0, count: int = 200, **kwargs) -> str:
-        """Generate SOAP envelope for PurchaseInfo."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:PurchaseInfo xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:purchaseNumber>{self._current_purchase_number}</tns:purchaseNumber>
-    </tns:PurchaseInfo>
-  </soap12:Body>
-</soap12:Envelope>"""
+    def get_starting_replication_key_value(self, context: Optional[dict] = None) -> Optional[str]:
+        """Get the starting replication key value from state.
+        
+        Args:
+            context: Optional stream context
+            
+        Returns:
+            Starting token value as string, or "0" if not found
+        """
+        state = self._tap_state
+        if "bookmarks" in state and self.name in state["bookmarks"]:
+            bookmark = state["bookmarks"][self.name]
+            replication_key = getattr(self, "replication_key", "Token")
+            replication_key_value = bookmark.get(replication_key) or bookmark.get("replication_key_value")
+            if replication_key_value is not None:
+                return str(replication_key_value)
+        return "0"
+
+    def _write_state_message(self) -> None:
+        """Write a STATE message with cleaned bookmarks.
+
+        Removes partition data for streams that do not have a replication key,
+        to avoid polluting ``state.json`` with non-incremental child stream
+        partitions (e.g. ``purchase_info``, ``supplier_info``).
+        """
+        tap_state = self.tap_state
+
+        if tap_state and tap_state.get("bookmarks"):
+            for stream_name, bookmark in list(tap_state["bookmarks"].items()):
+                # If the stream exists and has no replication key, drop partitions.
+                tap_stream = self._tap.streams.get(stream_name)
+                if (
+                    tap_stream is not None
+                    and not getattr(tap_stream, "replication_key", None)
+                    and bookmark.get("partitions")
+                ):
+                    bookmark["partitions"] = []
+
+        super()._write_state_message()
+
+    def _increment_stream_state(self, token: Union[str, Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> None:
+        """Increment stream state with token value.
+        
+        Args:
+            token: The new token value
+            context: Optional context dictionary
+        """
+        if isinstance(token, dict):
+            token_value = token.get("Token", token.get("token", 0))
+        else:
+            token_value = token
+        
+        token_value = int(token_value)
+        replication_key = getattr(self, "replication_key", "Token")
+        record = {replication_key: token_value}
+        super()._increment_stream_state(record, context=context)
+        self._total_records += 1
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10)
+    )
+    def _make_soap_request(self, service_name: str, soap_envelope: str, token: Optional[int] = None) -> dict:
+        """Make a SOAP request with retry logic.
+        
+        Args:
+            service_name: Name of the SOAP service
+            soap_envelope: SOAP envelope XML string
+            token: Optional token value for logging
+            
+        Returns:
+            Parsed response dictionary
+        """
+        try:
+            response = self.client.call_custom_soap_service(service_name, soap_envelope)
+            return self._parse_soap_response(response["raw_response"], service_name)
+        except Exception as e:
+            self.logger.error(f"[{self.name}] Error making SOAP request to {service_name}: {str(e)}")
+            raise
+
+    def _parse_soap_response(self, xml_response: str, service_name: str) -> dict:
+        """Parse SOAP XML response to dictionary.
+        
+        Args:
+            xml_response: Raw XML response string
+            service_name: Name of the service (for logging)
+            
+        Returns:
+            Parsed response dictionary
+        """
+        try:
+            xml_dict = xmltodict.parse(xml_response)
+            soap_body = xml_dict.get("soap:Envelope", {}).get("soap:Body", {})
+            
+            # Find the response data dynamically
+            response_data = None
+            for key, value in soap_body.items():
+                if "Response" in key and isinstance(value, dict):
+                    result_key = key.replace("Response", "Result")
+                    if result_key in value:
+                        response_data = value[result_key]
+                        break
+            
+            if response_data:
+                return response_data
+            
+            # Fallback: try to find ResponseValue directly
+            for key, value in soap_body.items():
+                if isinstance(value, dict) and "ResponseValue" in value:
+                    return value["ResponseValue"]
+            
+            return {}
+        except Exception as e:
+            self.logger.error(f"Failed to parse SOAP response: {e}")
+            return {}
+
+    def get_records_with_token_pagination(
+        self,
+        get_soap_envelope: Callable[[int, int], str],
+        service_name: str,
+        items_key: str,
+        context: Optional[dict] = None,
+        page_size: int = 200,
+    ) -> Iterable[Dict[str, Any]]:
+        """Get records using token-based pagination.
+        
+        Args:
+            get_soap_envelope: Function that generates SOAP envelope (token, count)
+            service_name: Name of the SOAP service
+            items_key: Key in response containing the items list
+            context: Optional stream context
+            page_size: Number of records per page
+            
+        Yields:
+            Records from the API
+        """
+        # Check if pagination is disabled for this stream
+        if not self.paginate:
+            # Non-paginated stream - make single request with token=0
+            token = "0"
+            self.logger.info(f"[{self.name}] Making single request (no pagination)")
+        else:
+            # Paginated stream - get token from state
+            token = self.get_starting_replication_key_value(context)
+            if not token or token == "0":
+                token = "1"
+            self.logger.info(f"[{self.name}] Starting sync with token: {token}")
+
+        while True:
+            # Generate SOAP envelope
+            current_token = int(token)
+            soap_envelope = get_soap_envelope(token=current_token, count=page_size)
+            
+            # Make request with token logging
+            self.logger.info(f"[{self.name}] Requesting {service_name} with token: {current_token}, page_size: {page_size}")
+            response = self._make_soap_request(service_name, soap_envelope, token=current_token)
+            
+            # Extract items from response
+            items = response.get(items_key, [])
+            if not items:
+                # Try ResponseValue as fallback
+                if "ResponseValue" in response:
+                    response_value = response["ResponseValue"]
+                    if isinstance(response_value, dict) and items_key in response_value:
+                        items = response_value[items_key]
+                    elif isinstance(response_value, list):
+                        items = response_value
+                
+            if not items:
+                self.logger.info(f"[{self.name}] No data in result, stopping pagination")
+                break
+            
+            # Ensure items is a list
+            if not isinstance(items, list):
+                items = [items]
+            
+            if not items:
+                self.logger.info(f"[{self.name}] Empty response, stopping pagination")
+                break
+            
+            self.logger.info(f"[{self.name}] Found {len(items)} items in '{items_key}'")
+            
+            # Process items and find highest token
+            highest_token = int(token)
+            response_time = response.get("ResponseTime", 0)
+            
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                    
+                item_token = int(item.get("Token", 0))
+                if item_token > highest_token:
+                    highest_token = item_token
+
+                # Process nested objects
+                processed_item = self._process_nested_objects(item)
+                
+                # Map and yield record
+                record = self.map_record(processed_item)
+                if record:
+                    record["response_time"] = response_time
+                    yield record
+
+            # Update token for next request (only if pagination is enabled)
+            if self.paginate:
+                if highest_token > int(token):
+                    next_token = str(highest_token)
+                    self.logger.info(f"[{self.name}] Token progression: {token} -> {next_token} (batch size: {len(items)})")
+                    token = next_token
+                    self._increment_stream_state(token)
+                    self._write_state_message()
+                else:
+                    self.logger.info(f"[{self.name}] No valid tokens found in response, stopping pagination")
+                    break
+            else:
+                # Non-paginated stream - only one request, break after processing
+                break
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get purchase info using the purchase_number from parent context."""
-        self._current_purchase_number = context["purchase_number"]
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="PurchaseInfo",
-            items_key="ResponseValue",
-            context=context,
-            page_size=page_size,
-        )
-
-
-class ChangedStockByWarehouseGroupCodeStream(SherpaStream):
-    """Stream for changed stock by warehouse group code."""
-    
-    name = "changed_stock_by_warehouse_group_code"
-    primary_keys = ["ItemCode"]
-    replication_key = "Token"
-    schema = th.PropertiesList(
-        th.Property("ItemCode", th.StringType),
-        th.Property("Available", th.StringType),
-        th.Property("Stock", th.StringType),
-        th.Property("Reserved", th.StringType),
-        th.Property("ItemStatus", th.StringType),
-        th.Property("ExpectedDate", th.DateTimeType),
-        th.Property("FirstExpectedDate", th.DateTimeType),
-        th.Property("FirstExpectedQtyWaitingToReceive", th.StringType),
-        th.Property("LastModified", th.DateTimeType),
-        th.Property("QtyWaitingToReceive", th.StringType),
-        th.Property("Token", th.StringType)
-    ).to_dict()
-
-    def _get_soap_envelope(self, token: int, count: int = 200) -> str:
-        """Generate SOAP envelope for ChangedStockByWarehousegroupCode."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:ChangedStockByWarehousegroupCode xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:token>{token}</tns:token>
-      <tns:warehousegroupCode>{self.config["warehouse_group_code"]}</tns:warehousegroupCode>
-      <tns:maxResult>{count}</tns:maxResult>
-    </tns:ChangedStockByWarehousegroupCode>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get records using token-based pagination."""
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="ChangedStockByWarehousegroupCode",
-            items_key="ItemStockGroupToken",
-            context=context,
-            page_size=page_size,
-        )
-
-
-class ChangedDeletedObjectsStream(SherpaStream):
-    """Stream for changed stock by warehouse group code."""
-    
-    name = "changed_deleted_objects"
-    primary_keys = ["Token"]
-    replication_key = "Token"
-    schema = th.PropertiesList(
-        th.Property("ObjectType", th.StringType),
-        th.Property("ObjectId", th.StringType),
-        th.Property("ObjectCode", th.StringType),
-        th.Property("UserId", th.StringType),
-        th.Property("UserName", th.StringType),
-        th.Property("Date", th.DateTimeType),
-        th.Property("Token", th.StringType)
-    ).to_dict()
-
-    def _get_soap_envelope(self, token: int, count: int = 200) -> str:
-        """Generate SOAP envelope for ChangedDeletedObjects."""
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <tns:ChangedDeletedObjects xmlns:tns="http://sherpa.sherpaan.nl/">
-      <tns:securityCode>{self.config["security_code"]}</tns:securityCode>
-      <tns:token>{token}</tns:token>
-      <tns:count>{count}</tns:count>
-    </tns:ChangedDeletedObjects>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        """Get records using token-based pagination."""
-        page_size = self.config.get("chunk_size", 200)
-        yield from self.get_records_with_token_pagination(
-            get_soap_envelope=self._get_soap_envelope,
-            service_name="ChangedDeletedObjects",
-            items_key="DeletedObject",
-            context=context,
-            page_size=page_size,
-        )
+        """Get records from the API.
+        
+        This method should be overridden by specific stream classes.
+        """
+        raise NotImplementedError("Stream classes must implement get_records")
