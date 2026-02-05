@@ -439,25 +439,21 @@ class PurchaseInfoStream(SherpaStream):
         th.Property("PurchaseStatus", th.DateTimeType),
         th.Property("Reference", th.StringType),
         th.Property("WarehouseCode", th.StringType),
-        th.Property("PurchaseLine", th.StringType)
+        th.Property("PurchaseLines", th.StringType)
     ).to_dict()
 
     def _process_nested_objects(self, item: dict) -> dict:
-        """Ensure PurchaseLine is always set: xmltodict returns one child as dict, not list."""
+        """Turn PurchaseLines from the response into a JSON array string."""
+        raw = item.get("PurchaseLines") or item.get("PurchaseLine")
+        if isinstance(raw, dict) and "PurchaseLine" in raw:
+            pl = raw["PurchaseLine"]
+            lines = pl if isinstance(pl, list) else [pl] if pl else []
+        elif isinstance(raw, list):
+            lines = raw
+        else:
+            lines = []
         processed = super()._process_nested_objects(item)
-        if processed.get("PurchaseLine"):
-            return processed
-        raw = processed.get("PurchaseLines")
-        if not raw:
-            return processed
-        if isinstance(raw, str):
-            try:
-                data = json.loads(raw)
-                if isinstance(data, dict) and "PurchaseLine" in data:
-                    pl = data["PurchaseLine"]
-                    processed["PurchaseLine"] = json.dumps(pl if isinstance(pl, list) else [pl])
-            except json.JSONDecodeError:
-                pass
+        processed["PurchaseLines"] = json.dumps(lines)
         return processed
 
     def _get_soap_envelope(self, token: int = 0, count: int = 200, **kwargs) -> str:
