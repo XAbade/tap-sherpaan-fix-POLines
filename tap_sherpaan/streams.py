@@ -1,7 +1,9 @@
 """Stream type classes for tap-sherpaan."""
 
 from __future__ import annotations
+
 import html
+import json
 from typing import Dict, Any, Iterable, Optional
 from singer_sdk import typing as th
 from tap_sherpaan.client import SherpaStream
@@ -437,8 +439,38 @@ class PurchaseInfoStream(SherpaStream):
         th.Property("PurchaseStatus", th.DateTimeType),
         th.Property("Reference", th.StringType),
         th.Property("WarehouseCode", th.StringType),
-        th.Property("PurchaseLine", th.StringType)
+        th.Property("PurchaseLines", th.StringType)
     ).to_dict()
+
+    def _process_nested_objects(self, item: dict) -> dict:
+        """Process item and set PurchaseLines to a flat JSON array of line objects."""
+        processed = super()._process_nested_objects(item)
+        # Find lines data (key may be PurchaseLines, PurchaseLine, or namespaced)
+        raw = processed.get("PurchaseLines") or processed.get("PurchaseLine")
+        if raw is None:
+            for key, value in processed.items():
+                if value is not None and "PurchaseLine" in key:
+                    raw = value
+                    break
+        if raw is not None:
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, dict) and "PurchaseLine" in data:
+                        pl = data["PurchaseLine"]
+                        lines = pl if isinstance(pl, list) else [pl]
+                        processed["PurchaseLines"] = json.dumps(lines)
+                    else:
+                        processed["PurchaseLines"] = raw
+                except json.JSONDecodeError:
+                    processed["PurchaseLines"] = raw
+            else:
+                processed["PurchaseLines"] = json.dumps(raw) if isinstance(raw, list) else json.dumps([raw])
+        # Keep only PurchaseLines; drop PurchaseLine and any namespaced variant
+        for key in list(processed.keys()):
+            if key != "PurchaseLines" and "PurchaseLine" in key:
+                del processed[key]
+        return processed
 
     def _get_soap_envelope(self, token: int = 0, count: int = 200, **kwargs) -> str:
         """Generate SOAP envelope for PurchaseInfo."""
